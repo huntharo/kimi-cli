@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from contextvars import ContextVar
+from contextvars import ContextVar, Token
 
 import acp
 import streamingjson  # type: ignore[reportMissingTypeStubs]
@@ -22,9 +22,11 @@ from kimi_cli.utils.logging import logger
 from kimi_cli.wire.types import (
     ApprovalRequest,
     ApprovalResponse,
+    AudioURLPart,
     CompactionBegin,
     CompactionEnd,
     ContentPart,
+    ImageURLPart,
     MCPLoadingBegin,
     MCPLoadingEnd,
     Notification,
@@ -73,6 +75,44 @@ def register_terminal_tool_call_id(tool_call_id: str) -> None:
 def should_hide_terminal_output(tool_call_id: str) -> bool:
     calls = _terminal_tool_call_ids.get()
     return calls is not None and tool_call_id in calls
+
+
+def _content_part_to_acp_block(part: ContentPart) -> ACPContentBlock:
+    if isinstance(part, TextPart):
+        return acp.schema.TextContentBlock(type="text", text=part.text)
+    if isinstance(part, ImageURLPart):
+        mime_type, data = _split_data_url(part.image_url.url)
+        if data is not None:
+            return acp.schema.ImageContentBlock(type="image", mime_type=mime_type, data=data)
+        return acp.schema.ResourceContentBlock(
+            type="resource_link",
+            uri=part.image_url.url,
+            name="image",
+            mime_type=mime_type,
+        )
+    if isinstance(part, AudioURLPart):
+        mime_type, data = _split_data_url(part.audio_url.url)
+        if data is not None:
+            return acp.schema.AudioContentBlock(type="audio", mime_type=mime_type, data=data)
+        return acp.schema.ResourceContentBlock(
+            type="resource_link",
+            uri=part.audio_url.url,
+            name="audio",
+            mime_type=mime_type,
+        )
+
+    logger.warning("Unsupported replay user content part: {part}", part=part)
+    return acp.schema.TextContentBlock(type="text", text=f"[{part.__class__.__name__}]")
+
+
+def _split_data_url(url: str) -> tuple[str, str | None]:
+    if not url.startswith("data:"):
+        return "application/octet-stream", None
+    header, sep, data = url.partition(",")
+    if not sep or ";base64" not in header:
+        return "application/octet-stream", None
+    mime_type = header.removeprefix("data:").removesuffix(";base64")
+    return mime_type or "application/octet-stream", data
 
 
 class _ToolCallState:
@@ -245,6 +285,112 @@ class ACPSession:
             _terminal_tool_call_ids.reset(terminal_tool_calls_token)
             _current_turn_id.reset(token)
         return acp.PromptResponse(stop_reason="end_turn")
+
+    async def replay_history(self) -> int:
+        """Replay persisted wire history as ACP session updates."""
+        old_turn_state = self._turn_state
+        turn_token: Token[str | None] | None = None
+        replayed_updates = 0
+        self._turn_state = None
+        try:
+            async for record in self._cli.soul.runtime.session.wire_file.iter_records():
+                msg = record.to_wire_message()
+                match msg:
+                    case TurnBegin(user_input=user_input):
+                        if turn_token is not None:
+                            _current_turn_id.reset(turn_token)
+                        self._turn_state = _TurnState()
+                        turn_token = _current_turn_id.set(self._turn_state.id)
+                        replayed_updates += await self._send_user_input(user_input)
+                    case SteerInput(user_input=user_input):
+                        replayed_updates += await self._send_user_input(user_input)
+                    case TurnEnd() | StepInterrupted():
+                        if turn_token is not None:
+                            _current_turn_id.reset(turn_token)
+                            turn_token = None
+                        self._turn_state = None
+                    case StepBegin():
+                        if turn_token is None:
+                            turn_token = self._begin_replay_turn()
+                    case ThinkPart(think=think):
+                        await self._send_thinking(think)
+                        replayed_updates += 1
+                    case TextPart(text=text):
+                        await self._send_text(text)
+                        replayed_updates += 1
+                    case ContentPart():
+                        logger.warning("Unsupported replay content part: {part}", part=msg)
+                        await self._send_text(f"[{msg.__class__.__name__}]")
+                        replayed_updates += 1
+                    case ToolCall():
+                        if turn_token is None:
+                            turn_token = self._begin_replay_turn()
+                        await self._send_tool_call(msg)
+                        replayed_updates += 1
+                    case ToolCallPart():
+                        if self._turn_state is not None:
+                            await self._send_tool_call_part(msg)
+                            replayed_updates += 1
+                    case ToolResult():
+                        if self._turn_state is not None:
+                            await self._send_tool_result(msg)
+                            replayed_updates += 1
+                    case Notification():
+                        await self._send_notification(msg)
+                        replayed_updates += 1
+                    case _:
+                        pass
+        finally:
+            if turn_token is not None:
+                _current_turn_id.reset(turn_token)
+            self._turn_state = old_turn_state
+        if replayed_updates == 0:
+            replayed_updates = await self._replay_context_history()
+        return replayed_updates
+
+    def _begin_replay_turn(self) -> Token[str | None]:
+        self._turn_state = _TurnState()
+        return _current_turn_id.set(self._turn_state.id)
+
+    async def _replay_context_history(self) -> int:
+        replayed_updates = 0
+        for message in self._cli.soul.context.history:
+            if message.role == "user":
+                replayed_updates += await self._send_user_input(list(message.content))
+            elif message.role == "assistant":
+                for part in message.content:
+                    if isinstance(part, ThinkPart):
+                        await self._send_thinking(part.think)
+                    elif isinstance(part, TextPart):
+                        await self._send_text(part.text)
+                    else:
+                        logger.warning("Unsupported context replay part: {part}", part=part)
+                        await self._send_text(f"[{part.__class__.__name__}]")
+                    replayed_updates += 1
+        return replayed_updates
+
+    async def _send_user_input(self, user_input: str | list[ContentPart]) -> int:
+        blocks: list[ACPContentBlock]
+        if isinstance(user_input, str):
+            blocks = [acp.schema.TextContentBlock(type="text", text=user_input)]
+        else:
+            blocks = [_content_part_to_acp_block(part) for part in user_input]
+
+        for block in blocks:
+            await self._send_user_block(block)
+        return len(blocks)
+
+    async def _send_user_block(self, block: ACPContentBlock) -> None:
+        if not self._id or not self._conn:
+            return
+
+        await self._conn.session_update(
+            session_id=self._id,
+            update=acp.schema.UserMessageChunk(
+                content=block,
+                session_update="user_message_chunk",
+            ),
+        )
 
     async def cancel(self) -> None:
         if self._turn_state is None:

@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import os
+
 import acp
 import pytest
 
 from kimi_cli.acp.version import CURRENT_VERSION
 
-from .conftest import ACPTestClient
+from .conftest import ACPTestClient, _kimi_bin, _repo_root
 
 pytestmark = pytest.mark.asyncio
 
@@ -146,6 +148,108 @@ async def test_resume_session_not_found(
             cwd=str(work_dir),
             session_id="non-existent-session-id",
         )
+
+
+async def test_load_session_replays_history(acp_share_dir, tmp_path):
+    """session/load rebinds the session and replays persisted transcript updates."""
+    env = {
+        **os.environ,
+        "KIMI_SHARE_DIR": str(acp_share_dir),
+    }
+    work_dir = tmp_path / "workdir"
+    work_dir.mkdir(exist_ok=True)
+
+    first_client = ACPTestClient()
+    async with acp.spawn_agent_process(
+        first_client,
+        _kimi_bin(),
+        "acp",
+        env=env,
+        cwd=str(_repo_root()),
+        use_unstable_protocol=True,
+    ) as (conn, _process):
+        await conn.initialize(protocol_version=1)
+        session_resp = await conn.new_session(cwd=str(work_dir))
+        await conn.prompt(
+            prompt=[acp.text_block("Replay this please")],
+            session_id=session_resp.session_id,
+        )
+        session_id = session_resp.session_id
+
+    second_client = ACPTestClient()
+    async with acp.spawn_agent_process(
+        second_client,
+        _kimi_bin(),
+        "acp",
+        env=env,
+        cwd=str(_repo_root()),
+        use_unstable_protocol=True,
+    ) as (conn, _process):
+        await conn.initialize(protocol_version=1)
+        load_resp = await conn.load_session(cwd=str(work_dir), session_id=session_id)
+
+    assert load_resp.modes is not None
+    assert load_resp.models is not None
+
+    replayed = [
+        (update.session_update, getattr(update.content, "text", None))
+        for update in second_client.updates
+        if hasattr(update, "content")
+    ]
+    assert ("user_message_chunk", "Replay this please") in replayed
+    assert ("agent_message_chunk", "Hello from scripted echo!") in replayed
+
+
+async def test_load_session_replays_context_when_wire_history_missing(acp_share_dir, tmp_path):
+    """Older ACP sessions can still replay text history if no wire log was recorded."""
+    env = {
+        **os.environ,
+        "KIMI_SHARE_DIR": str(acp_share_dir),
+    }
+    work_dir = tmp_path / "workdir"
+    work_dir.mkdir(exist_ok=True)
+
+    first_client = ACPTestClient()
+    async with acp.spawn_agent_process(
+        first_client,
+        _kimi_bin(),
+        "acp",
+        env=env,
+        cwd=str(_repo_root()),
+        use_unstable_protocol=True,
+    ) as (conn, _process):
+        await conn.initialize(protocol_version=1)
+        session_resp = await conn.new_session(cwd=str(work_dir))
+        await conn.prompt(
+            prompt=[acp.text_block("Replay from context")],
+            session_id=session_resp.session_id,
+        )
+        session_id = session_resp.session_id
+
+    wire_files = list(acp_share_dir.rglob("wire.jsonl"))
+    assert wire_files
+    for wire_file in wire_files:
+        wire_file.unlink()
+
+    second_client = ACPTestClient()
+    async with acp.spawn_agent_process(
+        second_client,
+        _kimi_bin(),
+        "acp",
+        env=env,
+        cwd=str(_repo_root()),
+        use_unstable_protocol=True,
+    ) as (conn, _process):
+        await conn.initialize(protocol_version=1)
+        await conn.load_session(cwd=str(work_dir), session_id=session_id)
+
+    replayed = [
+        (update.session_update, getattr(update.content, "text", None))
+        for update in second_client.updates
+        if hasattr(update, "content")
+    ]
+    assert ("user_message_chunk", "Replay from context") in replayed
+    assert ("agent_message_chunk", "Hello from scripted echo!") in replayed
 
 
 async def test_cancel_session(

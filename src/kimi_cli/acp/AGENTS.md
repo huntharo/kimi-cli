@@ -31,7 +31,9 @@
   - MCP servers passed by ACP are converted via `acp_mcp_servers_to_mcp_config`.
 - `session/load`
   - Multi-session only: loads by `Session.find`, then builds `KimiCLI` and `ACPSession`.
-  - No history replay yet (TODO).
+  - Replays persisted `wire.jsonl` history as ACP `session/update` notifications, falls back to
+    context text history for older sessions without wire history, and returns initial modes/models
+    state.
   - Single-session: not implemented.
 - `session/list`
   - Multi-session only: lists sessions via `Session.list`, no pagination.

@@ -255,18 +255,42 @@ class ACPServer:
 
     async def load_session(
         self, cwd: str, session_id: str, mcp_servers: list[MCPServer] | None = None, **kwargs: Any
-    ) -> None:
+    ) -> acp.schema.LoadSessionResponse:
         logger.info("Loading session: {id} for working directory: {cwd}", id=session_id, cwd=cwd)
 
         if session_id in self.sessions:
             logger.warning("Session already loaded: {id}", id=session_id)
-            return
+            acp_session, model_id_conv = self.sessions[session_id]
+        else:
+            # Check authentication before loading session
+            self._check_auth()
 
-        # Check authentication before loading session
-        self._check_auth()
+            acp_session, model_id_conv = await self._setup_session(cwd, session_id, mcp_servers)
 
-        await self._setup_session(cwd, session_id, mcp_servers)
-        # TODO: replay session history?
+        replayed_updates = await acp_session.replay_history()
+        logger.info(
+            "Replayed {count} ACP history updates for session: {id}",
+            count=replayed_updates,
+            id=session_id,
+        )
+
+        config = acp_session.cli.soul.runtime.config
+        return acp.schema.LoadSessionResponse(
+            modes=acp.schema.SessionModeState(
+                available_modes=[
+                    acp.schema.SessionMode(
+                        id="default",
+                        name="Default",
+                        description="The default mode.",
+                    ),
+                ],
+                current_mode_id="default",
+            ),
+            models=acp.schema.SessionModelState(
+                available_models=_expand_llm_models(config.models),
+                current_model_id=model_id_conv.to_acp_model_id(),
+            ),
+        )
 
     async def resume_session(
         self, cwd: str, session_id: str, mcp_servers: list[MCPServer] | None = None, **kwargs: Any
