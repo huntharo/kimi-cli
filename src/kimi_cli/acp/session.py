@@ -116,7 +116,21 @@ class _TurnState:
         self.tool_calls: dict[str, _ToolCallState] = {}
         """Map of tool call ID (LLM-side ID) to tool call state."""
         self.last_tool_call: _ToolCallState | None = None
+        self.content_run_kind: str | None = None
+        """The active ACP content run kind: `message` or `thought`."""
+        self.content_run_message_id: str | None = None
+        """Stable ACP message ID for the current contiguous content run."""
         self.cancel_event = asyncio.Event()
+
+    def reset_content_run(self) -> None:
+        self.content_run_kind = None
+        self.content_run_message_id = None
+
+    def content_run_id(self, kind: str) -> str:
+        if self.content_run_kind != kind or self.content_run_message_id is None:
+            self.content_run_kind = kind
+            self.content_run_message_id = str(uuid.uuid4())
+        return self.content_run_message_id
 
 
 class ACPSession:
@@ -161,29 +175,32 @@ class ACPSession:
             async for msg in self._cli.run(user_input, self._turn_state.cancel_event):
                 match msg:
                     case TurnBegin():
-                        pass
+                        self._reset_content_run()
                     case SteerInput():
-                        pass
+                        self._reset_content_run()
                     case TurnEnd():
-                        pass
+                        self._reset_content_run()
                     case StepBegin():
-                        pass
+                        self._reset_content_run()
                     case StepInterrupted():
+                        self._reset_content_run()
                         break
                     case StepRetry():
-                        pass
+                        self._reset_content_run()
                     case CompactionBegin():
-                        pass
+                        self._reset_content_run()
                     case CompactionEnd():
-                        pass
+                        self._reset_content_run()
                     case MCPLoadingBegin():
-                        pass
+                        self._reset_content_run()
                     case MCPLoadingEnd():
-                        pass
+                        self._reset_content_run()
                     case StatusUpdate():
-                        pass
+                        self._reset_content_run()
                     case Notification():
+                        self._reset_content_run()
                         await self._send_notification(msg)
+                        self._reset_content_run()
                     case ThinkPart(think=think):
                         await self._send_thinking(think)
                     case TextPart(text=text):
@@ -253,6 +270,14 @@ class ACPSession:
 
         self._turn_state.cancel_event.set()
 
+    def _reset_content_run(self) -> None:
+        if self._turn_state is not None:
+            self._turn_state.reset_content_run()
+
+    def _content_run_id(self, kind: str) -> str:
+        assert self._turn_state is not None
+        return self._turn_state.content_run_id(kind)
+
     async def _send_thinking(self, think: str):
         """Send thinking content to client."""
         if not self._id or not self._conn:
@@ -262,6 +287,7 @@ class ACPSession:
             self._id,
             acp.schema.AgentThoughtChunk(
                 content=acp.schema.TextContentBlock(type="text", text=think),
+                message_id=self._content_run_id("thought"),
                 session_update="agent_thought_chunk",
             ),
         )
@@ -275,6 +301,7 @@ class ACPSession:
             session_id=self._id,
             update=acp.schema.AgentMessageChunk(
                 content=acp.schema.TextContentBlock(type="text", text=text),
+                message_id=self._content_run_id("message"),
                 session_update="agent_message_chunk",
             ),
         )
@@ -292,6 +319,7 @@ class ACPSession:
         assert self._turn_state is not None
         if not self._id or not self._conn:
             return
+        self._reset_content_run()
 
         # Create and store tool call state
         state = _ToolCallState(tool_call)
@@ -353,6 +381,7 @@ class ACPSession:
         assert self._turn_state is not None
         if not self._id or not self._conn:
             return
+        self._reset_content_run()
 
         tool_ret = result.return_value
 
