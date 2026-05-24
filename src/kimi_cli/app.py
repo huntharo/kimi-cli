@@ -652,6 +652,7 @@ class KimiCLI:
                     user_input,
                     _ui_loop_fn,
                     run_cancel_event,
+                    wire_file=self._runtime.session.wire_file,
                     runtime=self._runtime,
                 )
             )
